@@ -400,9 +400,20 @@ int save_statefile(const char * fpath, const char * fname, void * data) {
 }
 
 
+/*
+int show_textfile(const char * fpath, const char * fname){
+    lcd_puts(t24, "Loading file:");
+    lcd_puts(t24, fname);
+    FIL* to_read;
+    f_open(to_read, fpath, FA_READ);
+    if ( to_read == nullptr){
+        return 1;
+    }
 
-
-
+    // Exit
+    return  0;
+}
+*/
 
 
 
