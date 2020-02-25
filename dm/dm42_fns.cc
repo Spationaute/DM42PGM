@@ -2,7 +2,7 @@
 
 BSD 3-Clause License
 
-Copyright (c) 2018, SwissMicros
+Copyright (c) 2015-2020, SwissMicros
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -357,10 +357,29 @@ int hp2regs(char *dst, const char *src, int srclen) {
   █▄▄█  █   ▀▄ █ ▀▀ █
  █    █ █    ▀ █    █ */
 
-#ifndef FW_RELEASE
-#define SHELL_DEBUG
-//#define SHELL_DEBUG_STATE_RW
-#define THELL_DEBUG
+
+extern "C" {
+  
+// -- External prototypes
+#include <main.h>
+#include <dmcp.h>
+
+#include <dm42_menu.h>
+#include <dm42_fns.h>
+
+#ifndef assert_param
+#define assert_param(c)
+#endif
+
+// ==== DEBUG
+
+#ifdef DEBUG_THELL
+ //#define SHELL_DEBUG_STATE_RW
+ #define THELL_DEBUG
+#endif
+
+#ifdef DEBUG_SHELL
+ #define SHELL_DEBUG
 #endif
 
 #ifdef SHELL_DEBUG
@@ -387,19 +406,15 @@ int hp2regs(char *dst, const char *src, int srclen) {
 #endif
 
 
+// ==== REGIONS
+#define MARK_42_KEYP            0xd3770101
+#define MARK_42_KEYR            0xd3770102
+#define MARK_42_KEY0            0xd3770103
+#define MARK_42_PGM_LOAD        0xd3770104
+#define MARK_42_PGM_SAVE        0xd3770105
+#define MARK_42_STAT_LOAD       0xd3770106
+#define MARK_42_STAT_SAVE       0xd3770107
 
-extern "C" {
-  
-// -- External prototypes
-#include <main.h>
-#include <dmcp.h>
-
-#include <dm42_menu.h>
-#include <dm42_fns.h>
-
-#ifndef assert_param
-#define assert_param(c)
-#endif
 
 
 // -- Local prototypes --
@@ -496,6 +511,7 @@ volatile  int repeat_timeout;
 #define SAVESTAT_PRTOF_TXT         BIT(19)
 #define SAVESTAT_PRTOF_NOIR        BIT(20)
 #define SAVESTAT_PRTOF_GR_IN_TXT   BIT(21)
+#define SAVESTAT_PRINT_DBLNL       BIT(22)
 
 
 typedef struct {
@@ -572,6 +588,7 @@ FRESULT pgm_res = FR_OK;
 #define PST_PRTOF_GRAPHICS    BIT(10)
 #define PST_PRTOF_NOIR        BIT(11)
 #define PST_PRTOF_GR_IN_TXT   BIT(12)
+#define PST_PRINT_DBLNL       BIT(13)
 
 
 static volatile uint32_t ann_state = 0;
@@ -939,6 +956,215 @@ void prtof_add_gr_text(const char *bits, int bytesperline, int width, int height
 
 
 
+
+/*
+ ▄▄▄▄▄▄   ▀  ▀▀█                                ▄                           ▄▀▀               
+ █      ▄▄▄    █    ▄▄▄    ▄▄▄   ▄   ▄   ▄▄▄   ▄█▄▄   ▄▄▄   ▄▄▄▄▄         ▄▄█▄▄  ▄ ▄▄    ▄▄▄  
+ █▄▄▄▄▄   █    █   █   █  █   ▀  ▀▄ ▄▀  █   ▀   █    █   █  █ █ █           █    █▀  █  █   ▀ 
+ █        █    █   █▀▀▀▀   ▀▀▀▄   █▄█    ▀▀▀▄   █    █▀▀▀▀  █ █ █           █    █   █   ▀▀▀▄ 
+ █      ▄▄█▄▄  ▀▄  ▀▄▄▄▀  ▀▄▄▄▀   ▀█    ▀▄▄▄▀   ▀▄▄  ▀▄▄▄▀  █ █ █           █    █   █  ▀▄▄▄▀ 
+                                  ▄▀                                                          
+                                 ▀▀                                                           
+*/
+
+
+extern "C" {
+
+
+// Halt for software error
+void halt(const char * txt, const char * file, int line) {
+  const int maxlen = 255;
+  char msg[maxlen+1];
+
+  snprintf(msg, maxlen, "%s:%i: %s", file, line, txt);
+
+  msg[maxlen]=0;
+  msg_box(t24, msg, 0);
+
+  lcd_refresh();
+
+  //for(;;)
+    wait_for_key_press();
+
+  //lcd_clear_buf();
+  msg_box(t24, "DONE", 1);
+  lcd_refresh();
+  for(;;)
+    wait_for_key_press();
+}
+
+
+// ------------
+// Map filesystem functions to statefile open/read/write/etc.
+#define FILE int
+#define EOF  (-1)
+#define SEEK_CUR 1
+#define SEEK_END 2
+
+//#define USE_SF_BUF
+
+#ifdef USE_SF_BUF
+#define CHECK_SF_BUF() if (sf_buf == NULL) halt("sf_buf not initialized", __func__, __LINE__)
+
+#define DEACTIVATE_SF_BUF deactivate_sf_buf
+
+void deactivate_sf_buf() {
+  if (sf_buf->active) {
+    int offs = f_tell(ppgm_fp);
+    pgm_res = f_lseek(ppgm_fp, 0);
+    pgm_res = f_lseek(ppgm_fp, offs);
+  }
+  sf_buf->active = 0;
+}
+
+#else
+#define CHECK_SF_BUF() if (sf_buf == NULL) halt("sf_buf not initialized", __func__, __LINE__)
+#define DEACTIVATE_SF_BUF()
+#endif
+
+
+#define SF_BUF_SIZE 512
+
+typedef struct {
+  uint8_t buf[SF_BUF_SIZE];
+  int offs;     // buffer position in file
+  int pos;      // ftell = buf_offs + pos
+  int last;     // last byte count read (valid bytes in buf)
+  int8 active;  // active only for getc/ungetc
+} sf_buf_t;
+
+sf_buf_t * sf_buf = NULL;
+
+void init_sf_buf() {
+  sf_buf = (sf_buf_t*)aux_buf_ptr();
+  sf_buf->active = 0;
+}
+
+void deinit_sf_buf() {
+  sf_buf = NULL;
+}
+
+
+
+//
+int statefile_read(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+  uint rd;
+  CHECK_SF_BUF();
+  DEACTIVATE_SF_BUF();
+  pgm_res = f_read(ppgm_fp, ptr, size*nmemb, &rd);
+  return rd/size;
+}
+
+//
+int statefile_write(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+  uint wr;
+  CHECK_SF_BUF();
+  DEACTIVATE_SF_BUF();
+  pgm_res = f_write(ppgm_fp, ptr, size*nmemb, &wr);
+  return wr/size;
+}
+
+//
+FILE *statefile_open(const char *pathname, const char *mode) {
+  return (FILE*)sf_buf; // File already opened
+}
+
+//
+int statefile_close(FILE *stream) {
+  CHECK_SF_BUF();
+  DEACTIVATE_SF_BUF();
+  return 0; // We want the file to stay open
+}
+
+//
+int statefile_seek(FILE *stream, long offset, int whence) {
+  int offs = (int)offset;
+  CHECK_SF_BUF();
+  DEACTIVATE_SF_BUF();
+  if (whence == SEEK_CUR) offs += f_tell(ppgm_fp);
+  if (whence == SEEK_END) f_size(ppgm_fp);
+
+  if (offs < 0) offs = 0;
+  pgm_res = f_lseek(ppgm_fp, offs);
+
+  return (pgm_res == FR_OK) ? 0 : EOF;
+}
+
+//
+int statefile_getc(FILE *stream) {
+  uint rd = 0;
+  unsigned char c;
+  CHECK_SF_BUF();
+
+  if (f_eof(ppgm_fp)) return EOF;
+
+#ifdef USE_SF_BUF
+  // Update sf_buf
+  if (!sf_buf->active || sf_buf->pos == sf_buf->last) {
+    int offs = f_tell(ppgm_fp);
+    pgm_res = f_read(ppgm_fp, sf_buf->buf, SF_BUF_SIZE, &rd);
+    if (pgm_res != FR_OK || rd == 0) {
+      DEACTIVATE_SF_BUF();
+      return EOF;
+    }
+    f_tell(ppgm_fp) = offs;
+    sf_buf->active = 1;
+    sf_buf->pos = 0;
+    sf_buf->last = rd;
+  }
+  c = sf_buf->buf[sf_buf->pos];
+  f_tell(ppgm_fp)++; // Advance file position
+#else
+  pgm_res = f_read(ppgm_fp, &c, 1, &rd);
+  if (pgm_res != FR_OK || rd == 0)
+    c = EOF;
+#endif
+
+  return c;
+}
+
+// 
+int statefile_ungetc(int c, FILE *stream) {
+  CHECK_SF_BUF();
+
+#ifdef USE_SF_BUF
+  if (!sf_buf->active) halt("sf_buf not active for ungetc", __FILE__, __LINE__);
+
+  if (sf_buf->pos == 0) return EOF;
+  if (c != sf_buf->buf[sf_buf->pos])
+    halt("ungetc doesn't match buf", __FILE__, __LINE__);
+  sf_buf->pos--;
+  f_tell(ppgm_fp)--; // Step back file position
+#else
+  int offs = f_tell(ppgm_fp);
+  if (offs == 0) return EOF;
+  pgm_res = f_lseek(ppgm_fp, offs-1);
+  if (pgm_res != FR_OK) return EOF;
+#endif
+  return c;
+}
+
+//
+long statefile_tell(FILE *stream) {
+  CHECK_SF_BUF();
+  return f_tell(ppgm_fp);
+}
+
+//
+int statefile_putc(int ic, FILE *stream) {
+  uint wr;
+  unsigned char c = (unsigned char)ic;
+  CHECK_SF_BUF();
+  pgm_res = f_write(ppgm_fp, &c, 1, &wr);
+  return wr ? c : EOF;
+}
+
+} // "C"
+
+// ------------
+
+
+
 /*
 ▄▄▄▄▄▄▄  ▄▄▄▄  ▄▄▄▄    ▄▄▄▄         ▄    ▄          ▀                  ▀▀█                                  ▄               █ 
    █    ▄▀  ▀▄ █   ▀▄ ▄▀  ▀▄        █    █ ▄ ▄▄   ▄▄▄    ▄▄▄▄▄  ▄▄▄▄     █     ▄▄▄   ▄▄▄▄▄   ▄▄▄   ▄ ▄▄   ▄▄█▄▄   ▄▄▄    ▄▄▄█ 
@@ -975,6 +1201,20 @@ int shell_get_heading(double*, double*, double*, double*, double*, double*) {
  ▀▄▄▄█▀ █   █  ▀█▄▄▀    ▀▄▄    ▀▄▄         █    █ █      ▄▄█▄▄ */
 
 
+const char *shell_platform() {
+  return "DM42 " PLATFORM_VERSION;
+}
+
+
+
+void shell_message(const char *message) {
+  msg_box(t24, message, 0);
+  lcd_refresh();
+  wait_for_key_press();
+}
+
+
+
 
 void shell_print(const char *text, int length,
   const char *bits, int bytesperline,
@@ -994,7 +1234,8 @@ void shell_print(const char *text, int length,
   //dump_buffer(bits, bytesperline*height);
 #endif
 
-  if ( !strncmp(text,"<lcd>",5) ) {
+  // changed in free42 2.5.x // if ( !strncmp(text,"<lcd>",5) ) {
+  if ( text == NULL ) {
     if ( width > MAX_82240_WIDTH )
       width = MAX_82240_WIDTH;
 
@@ -1008,7 +1249,8 @@ void shell_print(const char *text, int length,
       if (is_print_to_file(PRTOF_GR_IN_TXT))
         prtof_add_gr_text(bits, bytesperline, width, height);
       else
-        prtof_add_text(text,5,0);
+        // changed in free42 2.5.x // prtof_add_text(text,5,0);
+        prtof_add_text("<lcd>", 5, 0);
     }
 
     if (is_print_to_file(PRTOF_NOIR))
@@ -1084,6 +1326,11 @@ void shell_print(const char *text, int length,
   }
   if ( !is_gr_print ) {
     print_byte(10); // Flush the line
+    if (is_print_to_file(PRINT_DBLNL)) {
+      printer_advance_buf(PRINT_TXT_LN);
+      print_wait_for(PRINT_TXT_LN);
+      print_byte(10); // One more LF
+    }
     if ( is_wide_print() ) {
       print_byte(27); // ESC
       print_byte(252);// Return to normal-width characters
@@ -1295,7 +1542,7 @@ int shell_wants_cpu() {
   return res;
 }
 
-
+#if 0
 int shell_read(char *buf, int4 buflen) {
   DBGSHELL("shell_read: %08x : %i\n", (unsigned)buf, buflen);
   uint rd;
@@ -1312,7 +1559,7 @@ int shell_write(const char *buf, int4 buflen) {
   DBGSHELL(" ... write %i  err=%i\n",wr,pgm_res);
   return wr;
 }
-
+#endif
 
 uint4 shell_get_mem() {
   DBGSHELL("shell_get_mem: %i\n", sys_free_mem());
@@ -1402,6 +1649,7 @@ uint8_t is_graphics;
 uint8_t is_show;
 
 void clear_tlcd_row(int row) {
+  DBGTHELL("clear_tlcd_row(%i)\n", row);
   assert_param(row>=0 && row<2);
   memset(tlcd[row],' ',TLCD_LINELEN);
   tlcd[row][TLCD_LINELEN] = 0;
@@ -1498,7 +1746,7 @@ void thell_edit_number(const char * prompt, int prompt_len, const char * line, i
 
 
 void thell_draw_char(int x, int y, char c) {
-  //DBGTHELL("thell_draw_char %i %i : '%s'\n", x,y, str_from_hp(&c,1));
+  DBGTHELL("thell_draw_char %i %i : '%s'\n", x,y, str_from_hp(&c,1));
   assert_param(x>=0 && x<TLCD_LINELEN);
   assert_param(y>=0 && y<2);
 
@@ -1649,6 +1897,8 @@ extern "C"  {
 // -------------
 
 #define CALC_FLAG_AUDIO_ON  26
+#define CALC_FLAG_DMY       31
+#define CALC_FLAG_YMD       67
 
 void dm42_set_beep_mute(int val) {
   set_calc_flag(CALC_FLAG_AUDIO_ON, !val);
@@ -1658,6 +1908,21 @@ int dm42_is_beep_mute() {
   //return ST(STAT_BEEP_MUTE);
   return !get_calc_flag(CALC_FLAG_AUDIO_ON);
 }
+
+
+int dm42_get_dmy() {
+  return get_calc_flag(CALC_FLAG_YMD) ? 2 : get_calc_flag(CALC_FLAG_DMY);
+}
+
+void dm42_set_dmy(int val) {
+  if ( !(val & 2) ) {
+    set_calc_flag(CALC_FLAG_YMD, 0);
+    set_calc_flag(CALC_FLAG_DMY, val);
+  } else {
+    set_calc_flag(CALC_FLAG_YMD, 1);
+  }
+}
+
 
 
 
@@ -1836,6 +2101,7 @@ int is_print_to_file(int what) {
     case PRTOF_GRAPHICS:  res = PS(PRTOF_GRAPHICS);  break;
     case PRTOF_GR_IN_TXT: res = PS(PRTOF_GR_IN_TXT); break;
     case PRTOF_NOIR:      res = PS(PRTOF_NOIR);      break;
+    case PRINT_DBLNL:     res = PS(PRINT_DBLNL);     break;
   }
 
   return res;
@@ -1847,7 +2113,7 @@ void set_print_to_file_flag(int what, int val) {
     case PRTOF_GRAPHICS:  SETBY_PS(val, PRTOF_GRAPHICS);  break;
     case PRTOF_GR_IN_TXT: SETBY_PS(val, PRTOF_GR_IN_TXT); break;
     case PRTOF_NOIR:      SETBY_PS(val, PRTOF_NOIR);      break;
-
+    case PRINT_DBLNL:     SETBY_PS(val, PRINT_DBLNL);     break;
   }
 }
 
@@ -1910,9 +2176,9 @@ void prtof_buf_flush(int what, int full) {
           fail = update_bmp_file_header(ppgm_fp, PRTOF_BMP_WIDTH, 0, BG_COL_PAPER);
           break;
         case PRTOF_TEXT:
-          // Write BOM
-          res = f_write(ppgm_fp, "\xEF\xBB\xBF", PRTOF_TXT_HDR_SIZE, &wr);
-          if ( res != FR_OK ) { buf->err_cnt++; goto prtof_wf_err; }
+          // No more Write BOM
+          //res = f_write(ppgm_fp, "\xEF\xBB\xBF", PRTOF_TXT_HDR_SIZE, &wr);
+          //if ( res != FR_OK ) { buf->err_cnt++; goto prtof_wf_err; }
           break;
       }
       if (fail) {
@@ -2025,6 +2291,9 @@ int prtof_buf_update(int what) {
 void prtof_add_text(const char *str, int len, int dbl) {
   prtof_buf_t * buf = prtof_buf[PRTOF_TEXT];
 
+  if (buf->len + len > buf->buf_size)
+    prtof_buf_flush(PRTOF_TEXT, PRTOF_FULL_FLUSH);
+
   char * pa = buf->buf+buf->len;
   char * p = pa;
 
@@ -2042,11 +2311,19 @@ void prtof_add_text(const char *str, int len, int dbl) {
 
 /* Bit order: 01
               23
+
+  " ", "▘", "▝", "▀",    "▖", "▌", "▞", "▛",
+  "▗", "▚", "▐", "▜",    "▄", "▙", "▟", "█"};
+
+  Changed all chars to \uXXXX notation
+
 */
 
 const char * box_chars[16] = {
-  " ", "▘", "▝", "▀",    "▖", "▌", "▞", "▛",
-  "▗", "▚", "▐", "▜",    "▄", "▙", "▟", "▇"};
+  "\u00A0", "\u2598", "\u259D", "\u2580",
+  "\u2596", "\u258C", "\u259E", "\u259B",
+  "\u2597", "\u259A", "\u2590", "\u259C",
+  "\u2584", "\u2599", "\u259F", "\u2588"};
 
 
 void prtof_add_gr_text(const char *bits, int bpl, int width, int height) {
@@ -2059,10 +2336,10 @@ void prtof_add_gr_text(const char *bits, int bpl, int width, int height) {
   if (!height) return;
 
   for(int y=0; y<height; y+=2) {
-    char * pa = buf->buf+buf->len;
-    char * p = pa;
-
     for(int x=0; x<bpl; x++) {
+      char * pa = buf->buf+buf->len;
+      char * p = pa;
+
       int b2 = bits[x];
       int b1 = bits[x+bpl];
 
@@ -2070,16 +2347,16 @@ void prtof_add_gr_text(const char *bits, int bpl, int width, int height) {
         int a = ((b1&3)<<2)|(b2&3);
         //strcpy(p, box_chars[a]);
         *(int *)p = *(int*)(box_chars[a]);
-        p+= a ? 3 : 1;
+        p+= a ? 3 : 2;
         b1>>=2; b2>>=2;
       }
+      buf->len += p-pa;
+      prtof_buf_flush(PRTOF_TEXT, PRTOF_LIMIT_FLUSH);
     }
     bits += 2*bpl;
-
-    p += hp2utfchar(p, '\n');
-    buf->len += p-pa;
-    prtof_buf_flush(PRTOF_TEXT, PRTOF_LIMIT_FLUSH);
+    buf->len += hp2utfchar(buf->buf+buf->len, '\n');
   }
+  prtof_buf_flush(PRTOF_TEXT, PRTOF_LIMIT_FLUSH);
 }
 
 
@@ -2179,7 +2456,7 @@ set_ptf_err:
       lcd_puts(t24, msg);
       lcd_puts(t24, "");
       lcd_print(t24,"(Buffer size %i bytes)", prtof_buf_size(what));
-      lcd_puts(t24, "Press a key to continue");
+      lcd_puts(t24, "Press any key to continue");
       lcd_refresh();
       wait_for_key_press();
     }
@@ -2263,6 +2540,133 @@ void copy_reset_state_filename(char *s, int maxlen) {
 }
 
 
+// Returns 0 on success
+int statefile_save() {
+  int ret = -1;
+
+  if (sys_disk_ok()) {
+
+    lcd_for_dm42(DISP_SAVING_STATE);
+
+    sys_disk_write_enable(1);
+            
+    mark_region(MARK_42_STAT_SAVE);
+
+    savestat_init_write();
+
+    init_sf_buf();
+    // -- Changed somewhere in 2.x to core_save_state()
+    //core_enter_background();
+    core_save_state("x");
+    deinit_sf_buf();
+
+    // =============================
+    // == DM42 part of state file ==
+    // =============================
+    savestat_data_t dat;
+    uint wr;
+    memset(&dat,0,sizeof(dat));
+    dat.magic = SAVESTAT_MAGIC;
+
+    // == Statefile save flags
+    dat.flags = 0;
+    //dat.flags |= ST(STAT_BEEP_MUTE) ? SAVESTAT_FLAG_BEEP_MUTE : 0; // Using calc flag now
+    dat.flags |= ST(STAT_SLOW_AUTOREP) ? SAVESTAT_FLAG_SLOW_AUTOREP : 0;
+    dat.flags |= PS(PERM_MAIN_MENU) ? SAVESTAT_PERM_MAIN_MENU : 0;
+
+    dat.flags |= PS(PRTOF_TEXT)      ? SAVESTAT_PRTOF_TXT    : 0;
+    dat.flags |= PS(PRTOF_GRAPHICS)  ? SAVESTAT_PRTOF_GR     : 0;
+    dat.flags |= PS(PRTOF_NOIR)      ? SAVESTAT_PRTOF_NOIR   : 0;
+    dat.flags |= PS(PRTOF_GR_IN_TXT) ? SAVESTAT_PRTOF_GR_IN_TXT : 0;
+    dat.flags |= PS(PRINT_DBLNL)     ? SAVESTAT_PRINT_DBLNL  : 0;
+
+    // Top-bar header - DOW/DATE/TIME inverted as they are by default displayed
+    dat.flags |=  PS(DISP_STATFN)   ? SAVESTAT_DISP_STATFN   : 0;
+    dat.flags |= !PS(DISP_DOW)      ? SAVESTAT_DISP_DOW      : 0;
+    dat.flags |= !PS(DISP_DATE)     ? SAVESTAT_DISP_DATE     : 0;
+    dat.flags |=  PS(DISP_DATE_SEP0)? SAVESTAT_DISP_DATE_SEP0: 0;
+    dat.flags |=  PS(DISP_DATE_SEP1)? SAVESTAT_DISP_DATE_SEP1: 0;
+    dat.flags |=  PS(DISP_SHORTMON) ? SAVESTAT_DISP_SHORTMON : 0;
+    dat.flags |= !PS(DISP_TIME)     ? SAVESTAT_DISP_TIME     : 0;
+    dat.flags |=  PS(DISP_VOLTAGE)  ? SAVESTAT_FLAG_DISP_VOLTAGE : 0;
+    // --
+
+    int gm = graphics_mode();
+    dat.flags |= (gm & 1) ? SAVESTAT_FLAG_GMODE0 : 0;
+    dat.flags |= (gm & 2) ? SAVESTAT_FLAG_GMODE1 : 0;
+    
+    dat.flags |= is_REG_ALIGN_LEFT ? SAVESTAT_FLAG_REG_LEFT  : 0;
+    dat.flags |= is_REG_LINES      ? SAVESTAT_FLAG_REG_LINES : 0;
+    
+    int reflcd = ~get_reflcd_mask() & 7;
+    dat.flags |= (reflcd & 1) ? SAVESTAT_FLAG_REFLCD0 : 0;
+    dat.flags |= (reflcd & 2) ? SAVESTAT_FLAG_REFLCD1 : 0;
+    dat.flags |= (reflcd & 4) ? SAVESTAT_FLAG_REFLCD2 : 0;
+    // ==
+
+    dat.reg_font_ix = reg_font_ix;
+    dat.pgm_font_ix = pgm_font_ix;
+
+    dat.font_offsets[0] = (reg_font_offset>> 0) & 0xff;
+    dat.font_offsets[1] = (reg_font_offset>> 8) & 0xff;
+    dat.font_offsets[2] = (reg_font_offset>>16) & 0xff;
+
+    strcpy(dat.platf_ver,PLATFORM_VERSION);
+    dat.century = rtc_read_century();
+    
+    dat.printer_delay = core_printer_delay()/10;
+    if ( dat.printer_delay == 0 ) dat.printer_delay = 1;
+
+    dat.stack_layout = stack_layout;
+    
+    if (pgm_res == FR_OK)
+      pgm_res = f_write(ppgm_fp, &dat, sizeof(savestat_data_t), &wr);
+
+    FRESULT cls_res = f_close(ppgm_fp);
+
+    if ( sys_is_disk_write_enable() )
+      sys_disk_write_enable(0);
+
+    no_region();
+
+    sys_disk_check_valid(); // Unmount drive if disk is invalid
+
+    if ( sys_disk_ok() && (pgm_res != FR_OK || cls_res != FR_OK) ) {
+      // Fat storage OK but save state failed.
+      // That means statefile isn't saved and everything
+      // will be lost - display just write fail info and switch to
+      // soft off mode.
+      lcd_for_dm42(DISP_SAVE_FAILED);
+      SET_ST(STAT_SOFT_OFF);
+    } else {
+      // Success
+      ret = 0;
+    }
+
+  }
+
+  if ( !sys_disk_ok() ) {
+    // Disk fail means statefile isn't saved and everything
+    // will be lost - display just disk fail info and switch to
+    // soft off mode
+    disp_disk_info("Save Calculator State");
+  }
+
+  return ret;
+}
+
+
+
+
+/*
+ ▄▄▄▄     ▀                         ▄▄▄▄▄                      
+ █   ▀▄ ▄▄▄     ▄▄▄   ▄▄▄▄          █   ▀█  ▄▄▄    ▄▄▄▄   ▄▄▄  
+ █    █   █    █   ▀  █▀ ▀█         █▄▄▄▄▀ █▀  █  █▀ ▀█  █   ▀ 
+ █    █   █     ▀▀▀▄  █   █         █   ▀▄ █▀▀▀▀  █   █   ▀▀▀▄ 
+ █▄▄▄▀  ▄▄█▄▄  ▀▄▄▄▀  ██▄█▀         █    ▀ ▀█▄▄▀  ▀█▄▀█  ▀▄▄▄▀ 
+                      █                            ▄  █        
+                      ▀                             ▀▀         
+*/
 
 // Disp regs
 
@@ -2606,7 +3010,7 @@ void empty_keydown() {
 // Value in ms
 void setTimeout0(int timeout_type, int value) {
   if ( is_pgm_mode() && !is_slow_autorepeat() && (sys_last_key() == KEY_UP || sys_last_key() == KEY_DOWN) )
-    value = value/2; // Half in pgm mode
+    value = 2*value/3; // 2/3 in pgm mode
   printf("setTimeout0: %i : %i\n",timeout_type, value);
 
   timeout0_type = timeout_type;
@@ -2690,7 +3094,7 @@ void disp_header() {
 
 
   last_header_clk24 = is_clk24();
-  last_header_dmy = is_dmy();
+  last_header_dmy = dm42_get_dmy();
 
   //uint8_t lnfill; // Fill whole lines before writing line
   //uint8_t newln;  // New line after writing line
@@ -2703,12 +3107,11 @@ void disp_header() {
   // Black the header area
   lcd_fillLines(0, LCD_SET_VALUE, LCD_HEADER_LINES-2);
 
-  //lcd_printR(t24,"%i:",lll);   // DEBUG! REMOVE!
 /*
-  char s[PRINT_DT_TM_SZ], t[PRINT_DT_TM_SZ];
+  char s[PRINT _DT_TM_SZ], t[PRINT _DT_TM_SZ];
   const char * dowstr = is_disp(DISP_DOW) ? get_wday_shortcut(tm.dow) : "";
-  print_dmy_date(s,PRINT_DT_TM_SZ,&dt,dowstr,get_disp_date_sep());
-  print_clk24_time(t,PRINT_DT_TM_SZ,&tm,0,0);
+  print_dmy_date(s,PRINT_ DT_TM_SZ,&dt,dowstr,get_disp_date_sep());
+  print_clk24_time(t,PRINT_ DT_TM_SZ,&tm,0,0);
 
   lcd_printR(t24,"%s %s", s, t);
 */
@@ -2835,8 +3238,8 @@ void program_main() {
 
   after_fat_format = after_fat_format_dm42;
 
-  is_flag_dmy = is_dmy;
-  set_flag_dmy = set_dmy;
+  get_flag_dmy = dm42_get_dmy;
+  set_flag_dmy = dm42_set_dmy;
   is_flag_clk24 = is_clk24;
   set_flag_clk24 = set_clk24;
   is_beep_mute = dm42_is_beep_mute;
@@ -2851,7 +3254,7 @@ void program_main() {
 
   for(;;)
   {
-    if (last_header_clk24 != is_clk24() || last_header_dmy != is_dmy() )
+    if (last_header_clk24 != is_clk24() || last_header_dmy != dm42_get_dmy() )
       force_header_timeout();
 
     if ( (!ST(STAT_PGM_END) && !keep_running && key_empty()) ||
@@ -2916,108 +3319,13 @@ void program_main() {
 
         LCD_clear();
 
-        // Quit ... saving state and leave ...
-        if ( !ST(STAT_SOFT_OFF) && sys_disk_ok() ) {
-          lcd_for_dm42(DISP_SAVING_STATE);
+        // No more statefile save here...
+        core_save_state("x");
 
-          sys_disk_write_enable(1);
-          
-          mark_region(MARK_42_STAT_SAVE);
-          savestat_init_write();
-        }
-        // Saves the state, but we want to get back so 
-        // we don't want to call core_quit()
-        core_enter_background();
+        lcd_set_buf_cleared(0); // Mark no buffer change region
+        draw_power_off_image(is_graphics<=1);
+        printf("--- run=%i lcdclr=%i\n",resume_run,lcd_get_buf_cleared());
 
-        if ( !ST(STAT_SOFT_OFF) && sys_disk_ok() ) {
-          savestat_data_t dat;
-          uint wr;
-          memset(&dat,0,sizeof(dat));
-          dat.magic = SAVESTAT_MAGIC;
-
-          // == Statefile save flags
-          dat.flags = 0;
-          //dat.flags |= ST(STAT_BEEP_MUTE) ? SAVESTAT_FLAG_BEEP_MUTE : 0; // Using calc flag now
-          dat.flags |= ST(STAT_SLOW_AUTOREP) ? SAVESTAT_FLAG_SLOW_AUTOREP : 0;
-          dat.flags |= PS(PERM_MAIN_MENU) ? SAVESTAT_PERM_MAIN_MENU : 0;
-
-          dat.flags |= PS(PRTOF_TEXT)      ? SAVESTAT_PRTOF_TXT    : 0;
-          dat.flags |= PS(PRTOF_GRAPHICS)  ? SAVESTAT_PRTOF_GR     : 0;
-          dat.flags |= PS(PRTOF_NOIR)      ? SAVESTAT_PRTOF_NOIR   : 0;
-          dat.flags |= PS(PRTOF_GR_IN_TXT) ? SAVESTAT_PRTOF_GR_IN_TXT : 0;
-
-          // Top-bar header - DOW/DATE/TIME inverted as they are by default displayed
-          dat.flags |=  PS(DISP_STATFN)   ? SAVESTAT_DISP_STATFN   : 0;
-          dat.flags |= !PS(DISP_DOW)      ? SAVESTAT_DISP_DOW      : 0;
-          dat.flags |= !PS(DISP_DATE)     ? SAVESTAT_DISP_DATE     : 0;
-          dat.flags |=  PS(DISP_DATE_SEP0)? SAVESTAT_DISP_DATE_SEP0: 0;
-          dat.flags |=  PS(DISP_DATE_SEP1)? SAVESTAT_DISP_DATE_SEP1: 0;
-          dat.flags |=  PS(DISP_SHORTMON) ? SAVESTAT_DISP_SHORTMON : 0;
-          dat.flags |= !PS(DISP_TIME)     ? SAVESTAT_DISP_TIME     : 0;
-          dat.flags |=  PS(DISP_VOLTAGE)  ? SAVESTAT_FLAG_DISP_VOLTAGE : 0;
-          // --
-
-          int gm = graphics_mode();
-          dat.flags |= (gm & 1) ? SAVESTAT_FLAG_GMODE0 : 0;
-          dat.flags |= (gm & 2) ? SAVESTAT_FLAG_GMODE1 : 0;
-          
-          dat.flags |= is_REG_ALIGN_LEFT ? SAVESTAT_FLAG_REG_LEFT  : 0;
-          dat.flags |= is_REG_LINES      ? SAVESTAT_FLAG_REG_LINES : 0;
-          
-          int reflcd = ~get_reflcd_mask() & 7;
-          dat.flags |= (reflcd & 1) ? SAVESTAT_FLAG_REFLCD0 : 0;
-          dat.flags |= (reflcd & 2) ? SAVESTAT_FLAG_REFLCD1 : 0;
-          dat.flags |= (reflcd & 4) ? SAVESTAT_FLAG_REFLCD2 : 0;
-          // ==
-
-          dat.reg_font_ix = reg_font_ix;
-          dat.pgm_font_ix = pgm_font_ix;
-
-          dat.font_offsets[0] = (reg_font_offset>> 0) & 0xff;
-          dat.font_offsets[1] = (reg_font_offset>> 8) & 0xff;
-          dat.font_offsets[2] = (reg_font_offset>>16) & 0xff;
-
-          strcpy(dat.platf_ver,PLATFORM_VERSION);
-          dat.century = rtc_read_century();
-          
-          dat.printer_delay = core_printer_delay()/10;
-          if ( dat.printer_delay == 0 ) dat.printer_delay = 1;
-
-          dat.stack_layout = stack_layout;
-          
-          if (pgm_res == FR_OK)
-            pgm_res = f_write(ppgm_fp, &dat, sizeof(savestat_data_t), &wr);
-          FRESULT cls_res = f_close(ppgm_fp);
-
-          no_region();
-
-          sys_disk_check_valid(); // Unmount drive if disk is invalid
-          if ( sys_disk_ok() && (pgm_res != FR_OK || cls_res != FR_OK) ) {
-            // Fat storage OK but save state failed.
-            // That means statefile isn't saved and everything
-            // will be lost - display just write fail info and switch to
-            // soft off mode.
-            lcd_for_dm42(DISP_SAVE_FAILED);
-            SET_ST(STAT_SOFT_OFF);
-          }
-        }
-        else {
-          lcd_set_buf_cleared(0); // Mark no buffer change region
-          draw_power_off_image(is_graphics<=1);
-          printf("--- run=%i lcdclr=%i\n",resume_run,lcd_get_buf_cleared());
-        }
-
-        if ( sys_is_disk_write_enable() )
-          sys_disk_write_enable(0);
-
-        if ( !ST(STAT_SOFT_OFF) && !sys_disk_ok() ) {
-          // Disk fail means statefile isn't saved and everything
-          // will be lost - display just disk fail info and switch to
-          // soft off mode
-          disp_disk_info("Save Calculator State");
-          SET_ST(STAT_SOFT_OFF);
-        }
-        
         // -- Switch the calc state off --
         sys_critical_start();
         SET_ST(STAT_SUSPENDED);
@@ -3065,22 +3373,26 @@ void program_main() {
     // ========================
     // First initialization
     if ( !core_initialized ) {
-      int ver = FREE42_VERSION;
+      int ver = -1; // FREE42_VERSION;
 
       printf("DM42 start\n");
       //savestat_init(SAVEST_NEWEST); // Get one last saved
       if ( read_statefile ) {
         mark_region(MARK_42_STAT_LOAD);
         ver = savestat_init_read();
-        if ( pgm_res ) // No state file -> just restart
+        if ( ver < 0 ) // No state file -> just restart
           read_statefile = 0;
+        else
+          init_sf_buf();
       }
       // Init read start
 #ifdef STATEFILE_READ_DBG
       readix = 0;
 #endif
-      core_init(read_statefile, ver);
-      //core_init(read_statefile, FREE42_VERSION);
+      // Changed somewhere in 2.x
+      //core_init(read_statefile, ver);
+      //void core_init(int read_state, int4 version, const char *state_file_name, int offset);
+      core_init(read_statefile, ver, "x", 0);
       if ( read_statefile ) {
         savestat_data_t dat;
         uint rd;
@@ -3098,6 +3410,7 @@ void program_main() {
           set_print_to_file(PRTOF_GRAPHICS, dat.flags & SAVESTAT_PRTOF_GR, 0);
           set_print_to_file(PRTOF_NOIR, dat.flags & SAVESTAT_PRTOF_NOIR, 0);
           set_print_to_file(PRTOF_GR_IN_TXT, dat.flags & SAVESTAT_PRTOF_GR_IN_TXT, 0);
+          set_print_to_file(PRINT_DBLNL, dat.flags & SAVESTAT_PRINT_DBLNL, 0);
 
           // Top-Bar header DOW/DATE/TIME negative as those are displayed by default 
           SETBY_PS(  (dat.flags & SAVESTAT_DISP_STATFN), DISP_STATFN);
@@ -3133,6 +3446,7 @@ void program_main() {
           stack_layout = dat.stack_layout;
           if (stack_layout == 0) stack_layout = STACK_XYZTL; // Fall down to default for old savefiles
         }
+        deinit_sf_buf();
         f_close(ppgm_fp);
       } else {
         // State defaults
@@ -3152,7 +3466,7 @@ void program_main() {
       //  draw_gr_off_image();
       //else 
       {
-        rtc_check_unset();
+        //rtc_check_unset(); // Already done by DMCP ... or?
         calc_lcd_redraw();
       }
 
@@ -3257,7 +3571,7 @@ void program_main() {
           //test_help_fonts();
           //help_demo();
           if ( !ANN(RUN) ) { // We don't want to display help during program run
-            run_help();
+            start_help();
             calc_lcd_redraw();
           } 
           break;
@@ -3313,9 +3627,9 @@ void program_main() {
 
       if ( consume_key ) key = -1;
 
-      if ( redraw && !ANN(RUN) ) {
-        disp_regs(LCD_UPD_DFLT);
-        lcd_refresh();
+      if ( redraw ) { // We want complete update after font size change // && !ANN(RUN)
+        disp_regs(LCD_UPD_ALL); // LCD_UPD_DFLT
+        lcd_refresh_wait();
       }
 
     } // == End of main menu function keys handling
@@ -3402,9 +3716,17 @@ void program_main() {
         SET_ST(STAT_MENU);
         int ret = handle_menu(&MID_MENU, MENU_RESET, 0);
         CLR_ST(STAT_MENU);
-        if ( ret == MRET_SAVESTATE ) { // FIXME: Really?
-          CLR_ST(STAT_SOFT_OFF); // Hard off
-          key = KEY_EXIT;
+        if ( ret == MRET_SAVESTATE ) {
+          //CLR_ST(STAT_SOFT_OFF); // Hard off
+          //key = KEY_EXIT;
+          if (!statefile_save()) {
+            // Success
+            // Reset the system to force new statefile load
+            set_reset_magic(NO_SPLASH_MAGIC);
+            sys_reset();
+          }
+          // Statefile save fail - just wait for key to review displayed errors
+          wait_for_key_press();
         }
         calc_lcd_redraw();
         wait_for_key_release(-1);
